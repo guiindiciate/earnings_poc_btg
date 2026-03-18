@@ -1,0 +1,44 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Packaging / build
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment files (keep .env.example, ignore actual .env)
+.env
+
+# Database files (SQLite)
+*.db
+*.sqlite
+*.sqlite3
+
+# Output Excel files
+output/
+
+# pytest cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Review queue artefacts (keep the .gitkeep, ignore JSON files)
+review_queue/*.json
