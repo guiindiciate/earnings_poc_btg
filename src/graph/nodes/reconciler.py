@@ -1,83 +1,118 @@
-"""Node 4 — Reconciler (auto-correction via LLM).
-
-When the validator detects errors and the retry budget has not been exhausted,
-this node asks the LLM to correct only the problematic fields, then increments
-``retry_count`` so the validator can re-evaluate.
 """
+Nó 4 — Reconciler
 
-from __future__ import annotations
+Tenta corrigir automaticamente os erros apontados pelo validator.
+Usa o mesmo LLM provider configurado (Bedrock por padrão).
+Máximo de MAX_RETRIES tentativas antes de escalar para human_review.
+"""
 
 import json
 import logging
-from typing import Any
 
-from src.graph.nodes.extractor import _call_llm, _extract_json, _validate_core_with_pydantic
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from config.settings import MAX_RETRIES
 from src.graph.state import EarningsState
-from src.schema.prompts import RECONCILER_PROMPT
+from src.llm_client import get_llm
+from src.schema.prompts import RECONCILER_PROMPT_V1
 
 logger = logging.getLogger(__name__)
 
-# Max chars from raw_text to include as reference context
-_CONTEXT_WINDOW = 8_000
-
 
 def reconciler_node(state: EarningsState) -> EarningsState:
-    """Attempt to auto-correct extraction errors using the LLM.
-
-    Uses :data:`~src.schema.prompts.RECONCILER_PROMPT` to provide the model
-    with the list of errors and the previously extracted data, then parses and
-    re-validates the corrected JSON.
-
-    Increments ``retry_count`` regardless of success so the validator loop
-    terminates after ``MAX_RETRIES`` attempts.
-
-    Parameters
-    ----------
-    state:
-        Current pipeline state.
-
-    Returns
-    -------
-    EarningsState
-        Updated state with potentially corrected ``core_metrics`` and
-        incremented ``retry_count``.
     """
-    errors = state.get("validation_errors", [])
-    core_metrics = state.get("core_metrics", {})
-    raw_text = state.get("raw_text", "")
-    retry_count = state.get("retry_count", 0)
+    Recebe o estado com erros de validação e tenta corrigir via LLM.
+    Incrementa retry_count a cada chamada.
+    """
+    retry_count = state.get("retry_count", 0) + 1
+    logger.info(
+        f"[{state['ticker']}] Reconciler — tentativa {retry_count}/{MAX_RETRIES}. "
+        f"Erros: {state['validation_errors']}"
+    )
 
-    logger.info("[reconciler] Attempting correction (retry %d)", retry_count + 1)
+    llm = get_llm()
 
-    # Build a short relevant excerpt (first _CONTEXT_WINDOW chars of raw text)
-    trecho_relevante = raw_text[:_CONTEXT_WINDOW]
+    # Extrai trecho relevante do documento para contexto
+    trecho_relevante = _extract_relevant_excerpt(
+        state.get("raw_text", ""),
+        state["validation_errors"]
+    )
 
-    updated_core: dict[str, Any] = core_metrics
+    prompt = RECONCILER_PROMPT_V1.format(
+        erros="\n".join(f"- {e}" for e in state["validation_errors"]),
+        dados_anteriores=json.dumps(state.get("core_metrics", {}), ensure_ascii=False, indent=2),
+        trecho_relevante=trecho_relevante[:3000],
+    )
 
-    try:
-        prompt = RECONCILER_PROMPT.format(
-            erros="\n".join(f"- {e}" for e in errors),
-            dados_anteriores=json.dumps(core_metrics, ensure_ascii=False, indent=2),
-            trecho_relevante=trecho_relevante,
-        )
-        logger.info("[reconciler] Calling LLM for correction")
-        response = _call_llm(prompt)
+    response = llm.invoke([
+        SystemMessage(
+            content="Você é um analista financeiro realizando correção de dados "
+                    "extraídos de earnings releases brasileiros."
+        ),
+        HumanMessage(content=prompt),
+    ])
 
-        # The reconciler prompt returns JSON first, then explanations after "##"
-        # We only care about the JSON part (everything before the first "##")
-        json_part = response.split("##")[0].strip()
-        raw_corrected = _extract_json(json_part)
-        updated_core = _validate_core_with_pydantic(raw_corrected)
-        logger.info("[reconciler] Correction successful")
+    # Extrai JSON corrigido da resposta
+    corrected_metrics = _extract_corrected_json(response.content)
 
-    except Exception as exc:
-        logger.error("[reconciler] Correction failed: %s", exc)
-        # Keep original core_metrics; let the validator decide what to do next
+    if corrected_metrics:
+        logger.info(f"[{state['ticker']}] Reconciler corrigiu {len(corrected_metrics)} campos.")
+        # Merge das correções nos core_metrics existentes
+        updated_metrics = {**state.get("core_metrics", {}), **corrected_metrics}
+    else:
+        logger.warning(f"[{state['ticker']}] Reconciler não produziu JSON válido.")
+        updated_metrics = state.get("core_metrics", {})
 
     return {
         **state,
-        "core_metrics": updated_core,
-        "retry_count": retry_count + 1,
-        # Reset validation_errors so the validator runs fresh
-        "validation_errors": [],
+        "core_metrics": updated_metrics,
+        "retry_count": retry_count,
+        "validation_errors": [],  # reseta para o validator rodar novamente
     }
+
+
+def _extract_relevant_excerpt(text: str, errors: list[str]) -> str:
+    """
+    Extrai trecho relevante do documento com base nas keywords dos erros.
+    Retorna até 3000 chars do trecho mais relevante.
+    """
+    if not text or not errors:
+        return text[:3000] if text else ""
+
+    # Keywords dos erros para busca no documento
+    keywords = []
+    for error in errors:
+        error_lower = error.lower()
+        if "dívida" in error_lower or "divida" in error_lower:
+            keywords.extend(["dívida", "endividamento", "debt"])
+        if "ebitda" in error_lower:
+            keywords.extend(["ebitda", "resultado"])
+        if "margem" in error_lower:
+            keywords.extend(["margem", "margin"])
+
+    # Encontra parágrafo mais relevante
+    paragraphs = text.split("\n\n")
+    for paragraph in paragraphs:
+        if any(kw.lower() in paragraph.lower() for kw in keywords):
+            return paragraph[:3000]
+
+    return text[:3000]
+
+
+def _extract_corrected_json(response_text: str) -> dict:
+    """Extrai o JSON corrigido da resposta do reconciler."""
+    text = response_text.strip()
+
+    # Remove markdown se presente
+    if "```" in text:
+        # Pega apenas a parte antes das explicações
+        json_part = text.split("## Correções")[0]
+        lines = json_part.split("\n")
+        json_lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(json_lines).strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning("Não foi possível extrair JSON da resposta do reconciler.")
+        return {}
