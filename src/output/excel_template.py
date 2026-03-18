@@ -6,8 +6,10 @@ are centralised here to make visual changes easy without touching business logic
 
 from __future__ import annotations
 
+import openpyxl.cell.cell
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
 
 # ── Colour palette ─────────────────────────────────────────────────────────────
 
@@ -48,7 +50,7 @@ MIN_COL_WIDTH = 12
 MAX_COL_WIDTH = 40
 
 
-def auto_fit_columns(worksheet) -> None:  # type: ignore[no-untyped-def]
+def auto_fit_columns(worksheet: Worksheet) -> None:
     """Adjust column widths to fit content (capped at :data:`MAX_COL_WIDTH`).
 
     Parameters
@@ -70,7 +72,7 @@ def auto_fit_columns(worksheet) -> None:  # type: ignore[no-untyped-def]
         worksheet.column_dimensions[col_letter].width = adjusted
 
 
-def style_header_cell(cell, bold: bool = True) -> None:  # type: ignore[no-untyped-def]
+def style_header_cell(cell: "openpyxl.cell.cell.Cell", bold: bool = True) -> None:
     """Apply header styling to a single cell.
 
     Parameters
@@ -86,7 +88,7 @@ def style_header_cell(cell, bold: bool = True) -> None:  # type: ignore[no-untyp
     cell.border = THIN_BORDER
 
 
-def style_data_cell(cell, row_idx: int, number_format: str | None = None) -> None:  # type: ignore[no-untyped-def]
+def style_data_cell(cell: "openpyxl.cell.cell.Cell", row_idx: int, number_format: str | None = None) -> None:
     """Apply alternating row styling to a data cell.
 
     Parameters
@@ -107,7 +109,7 @@ def style_data_cell(cell, row_idx: int, number_format: str | None = None) -> Non
         cell.number_format = number_format
 
 
-def style_variation_cell(cell, value: float | None, row_idx: int) -> None:  # type: ignore[no-untyped-def]
+def style_variation_cell(cell: "openpyxl.cell.cell.Cell", value: float | None, row_idx: int) -> None:
     """Apply coloured font to a variation cell (green = positive, red = negative).
 
     Parameters
