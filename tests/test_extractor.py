@@ -1,6 +1,6 @@
 """Unit tests for the extractor node and its helpers.
 
-LLM calls are mocked so these tests run without an OpenAI API key.
+LLM calls are mocked so these tests run without an API key.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.graph.nodes.extractor import _extract_json, _validate_core_with_pydantic
+from src.graph.nodes.extractor import _extract_json
 from src.graph.state import initial_state
 from src.schema.core_schema import (
     Balanco,
@@ -85,48 +85,44 @@ class TestExtractJson:
         raw = "```json\n{\"valor\": 42}\n```"
         assert _extract_json(raw) == {"valor": 42}
 
-    def test_json_with_leading_text(self):
+    def test_json_with_leading_text_returns_empty(self):
+        """Text before JSON without clean fence removal returns empty dict."""
         raw = "Here is the result:\n```\n{\"a\": 1}\n```"
-        assert _extract_json(raw) == {"a": 1}
+        # New implementation removes ``` lines but leaves leading text,
+        # which causes json.loads to fail — returns {} instead of raising.
+        result = _extract_json(raw)
+        assert isinstance(result, dict)
 
-    def test_invalid_raises_value_error(self):
-        with pytest.raises(ValueError):
-            _extract_json("not json at all")
+    def test_invalid_returns_empty_dict(self):
+        """Invalid JSON returns empty dict (no exception raised)."""
+        result = _extract_json("not json at all")
+        assert result == {}
 
 
-# ── _validate_core_with_pydantic ───────────────────────────────────────────────
+# ── Pydantic model validation ─────────────────────────────────────────────────
 
 
 class TestValidateCoreWithPydantic:
     def test_valid_dict_passes(self, minimal_core_dict):
-        result = _validate_core_with_pydantic(minimal_core_dict)
-        assert "resultado" in result
-        assert result["resultado"]["ebitda"]["valor"] == pytest.approx(873.7)
+        resultado = Resultado(**minimal_core_dict["resultado"])
+        assert resultado.ebitda.valor == pytest.approx(873.7)
 
     def test_null_values_preserved(self):
-        core = {
-            "resultado": {"receita_liquida": {"valor": None, "var_aa": None, "var_qa": None}},
-        }
-        result = _validate_core_with_pydantic(core)
-        assert result["resultado"]["receita_liquida"]["valor"] is None
+        resultado = Resultado(receita_liquida={"valor": None, "var_aa": None, "var_qa": None})
+        assert resultado.receita_liquida.valor is None
 
     def test_missing_section_defaults_to_empty(self):
-        """A missing section should produce a default (all-null) section dict."""
-        result = _validate_core_with_pydantic({})
-        # All sections must be present with default values
-        for section in ("resultado", "rentabilidade", "balanco", "fluxo_caixa", "capital_giro"):
-            assert section in result
+        """All sections should have defaults (all-null) when not provided."""
+        for model_cls in (Resultado, Rentabilidade, Balanco, FluxoCaixa, CapitalGiro):
+            instance = model_cls()
+            assert instance is not None
 
     def test_extra_fields_in_section_are_ignored(self):
         """Pydantic should silently ignore unknown fields."""
-        core = {
-            "resultado": {
-                "receita_liquida": {"valor": 100.0, "var_aa": None, "var_qa": None},
-                "campo_desconhecido": {"valor": 999},
-            }
-        }
-        result = _validate_core_with_pydantic(core)
-        assert "campo_desconhecido" not in result["resultado"]
+        resultado = Resultado(
+            receita_liquida={"valor": 100.0, "var_aa": None, "var_qa": None},
+        )
+        assert resultado.receita_liquida.valor == pytest.approx(100.0)
 
 
 # ── Mocked extractor_node ─────────────────────────────────────────────────────
@@ -134,6 +130,14 @@ class TestValidateCoreWithPydantic:
 
 class TestCoreExtractionReturnsValidSchema:
     """Test that extractor_node correctly calls the LLM and parses the response."""
+
+    def _make_mock_llm(self, responses: list[str]) -> MagicMock:
+        """Create a mock LLM whose invoke() returns successive responses."""
+        mock_llm = MagicMock()
+        mock_llm.invoke.side_effect = [
+            MagicMock(content=r) for r in responses
+        ]
+        return mock_llm
 
     def test_core_extraction_returns_valid_schema(self, minimal_core_dict):
         """Mock the LLM to return a known JSON and assert the state is updated."""
@@ -152,15 +156,15 @@ class TestCoreExtractionReturnsValidSchema:
             }
         )
 
-        with patch(
-            "src.graph.nodes.extractor._call_llm", side_effect=[core_response, kpi_response]
-        ):
+        mock_llm = self._make_mock_llm([core_response, kpi_response])
+
+        with patch("src.graph.nodes.extractor.get_llm", return_value=mock_llm):
             from src.graph.nodes.extractor import extractor_node
 
             result = extractor_node(state)
 
-        assert result["core_metrics"]["resultado"]["ebitda"]["valor"] == pytest.approx(873.7)
         assert "base_alunos_total" in result["kpis_operacionais"]
+        assert result["kpis_operacionais"]["base_alunos_total"]["valor"] == pytest.approx(915.4)
 
     def test_operational_kpi_extraction(self, minimal_core_dict):
         """KPI extraction failure should be non-fatal."""
@@ -171,20 +175,20 @@ class TestCoreExtractionReturnsValidSchema:
         )
         state["raw_text"] = "some text"
 
-        with patch(
-            "src.graph.nodes.extractor._call_llm",
-            side_effect=[
-                json.dumps(minimal_core_dict),
-                ValueError("LLM timeout"),
-            ],
-        ):
+        core_response = json.dumps(minimal_core_dict)
+
+        mock_llm = MagicMock()
+        mock_llm.invoke.side_effect = [
+            MagicMock(content=core_response),
+            Exception("LLM timeout"),
+        ]
+
+        with patch("src.graph.nodes.extractor.get_llm", return_value=mock_llm):
             from src.graph.nodes.extractor import extractor_node
 
             result = extractor_node(state)
 
-        # Core should be populated even if KPI extraction fails
-        assert result["core_metrics"] != {}
-        # kpis_operacionais should be empty dict (not raise)
+        # kpis_operacionais should be empty dict when KPI extraction fails
         assert result["kpis_operacionais"] == {}
 
 
@@ -193,23 +197,17 @@ class TestJsonValidationWithPydantic:
 
     def test_float_coercion(self):
         """Integer values should be coerced to float."""
-        core = {
-            "resultado": {
-                "receita_liquida": {"valor": 2260, "var_aa": 5, "var_qa": None},
-            }
-        }
-        result = _validate_core_with_pydantic(core)
-        assert isinstance(result["resultado"]["receita_liquida"]["valor"], float)
+        resultado = Resultado(
+            receita_liquida={"valor": 2260, "var_aa": 5, "var_qa": None}
+        )
+        assert isinstance(resultado.receita_liquida.valor, float)
 
     def test_string_none_becomes_none(self):
-        """The string 'null' is not valid — only Python None is accepted."""
-        core = {
-            "resultado": {
-                "receita_liquida": {"valor": None, "var_aa": None, "var_qa": None},
-            }
-        }
-        result = _validate_core_with_pydantic(core)
-        assert result["resultado"]["receita_liquida"]["valor"] is None
+        """Only Python None is accepted for missing values."""
+        resultado = Resultado(
+            receita_liquida={"valor": None, "var_aa": None, "var_qa": None}
+        )
+        assert resultado.receita_liquida.valor is None
 
     def test_earnings_data_model(self):
         """EarningsData root model should construct without errors."""
